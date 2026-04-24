@@ -10,7 +10,7 @@ import sys
 import time
 import logging
 import argparse
-import asyncio
+import json
 from pathlib import Path
 
 # Add project root to path
@@ -25,6 +25,7 @@ from app.processor.worker import ProcessorWorker
 from app.exporter.csv_exporter import CSVExporter
 from app.db.sqlserver import SQLServerDB
 from app.health import HealthServer
+from app.validation import EventValidator
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,52 @@ class UsageTrackerService:
         # 5. Start IPC listener for agent events
         self._start_ipc_server()
         logger.info("IPC server started — waiting for agent connections")
+        
+        # 6. Replay any agent fallback queue (M5 fix)
+        self._replay_agent_fallback_queue()
+    
+    def _replay_agent_fallback_queue(self):
+        """Replay events written by agent during service downtime."""
+        try:
+            from app.config import BASE_DIR
+            queue_file = Path(BASE_DIR) / 'data' / 'agent_events.jsonl'
+            if not queue_file.exists():
+                return
+            
+            count = 0
+            with open(queue_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                        # Validate and enqueue (use same logic as IPC handler)
+                        ev_type = event.get('type', 'app')
+                        if ev_type == 'app':
+                            validated = EventValidator.validate_app_event(event)
+                        elif ev_type == 'web':
+                            validated = EventValidator.validate_web_event(event)
+                        else:
+                            validated = None
+                        
+                        if validated:
+                            self.queue.enqueue(validated)
+                            count += 1
+                        else:
+                            logger.warning(f"Skipped invalid event during replay: {event}")
+                    except json.JSONDecodeError:
+                        logger.error(f"Malformed JSON in fallback queue: {line}")
+            
+            if count > 0:
+                logger.info(f"Replayed {count} events from agent fallback queue")
+                # Truncate the file after successful replay
+                queue_file.write_text('', encoding='utf-8')
+            else:
+                logger.debug("No agent fallback events to replay")
+                
+        except Exception as e:
+            logger.error(f"Failed to replay agent fallback queue: {e}")
     
     def _start_ipc_server(self):
         """Start TCP socket server on 127.0.0.1:8766 to accept events from agent."""
