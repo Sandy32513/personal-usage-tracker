@@ -42,7 +42,7 @@ BEGIN
         [title] NVARCHAR(1000) NULL,               -- Page title (for web events)
         [timestamp] DATETIME2 NOT NULL,            -- When event occurred (UTC)
         [duration_seconds] INT DEFAULT 0,          -- Duration if available
-        [created_at] DATETIME2 DEFAULT GETDATE(),  -- Record creation time
+        [created_at] DATETIME2 DEFAULT SYSUTCDATETIME(),  -- Record creation time (UTC)
         CONSTRAINT [chk_event_type] CHECK ([type] IN ('app', 'web'))
     )
     PRINT '    Table [events] created.'
@@ -128,8 +128,8 @@ BEGIN
             MIN([timestamp]) as first_seen,
             MAX([timestamp]) as last_seen
         FROM [dbo].[events]
-        WHERE [type] = ''app''
-          AND [timestamp] >= DATEADD(day, -@Days, GETDATE())
+         WHERE [type] = ''app''
+           AND [timestamp] >= DATEADD(day, -@Days, SYSUTCDATETIME())
         GROUP BY app_name
         ORDER BY total_seconds DESC;
     END
@@ -154,8 +154,8 @@ BEGIN
             SUM(ISNULL(duration_seconds, 0)) as total_seconds,
             MAX([timestamp]) as last_visit
         FROM [dbo].[events]
-        WHERE [type] = ''web''
-          AND [timestamp] >= DATEADD(day, -@Days, GETDATE())
+         WHERE [type] = ''web''
+           AND [timestamp] >= DATEADD(day, -@Days, SYSUTCDATETIME())
         GROUP BY url
         ORDER BY visit_count DESC;
     END
@@ -180,7 +180,7 @@ BEGIN
             COUNT(DISTINCT app_name) as unique_apps,
             COUNT(DISTINCT url) as unique_urls
         FROM [dbo].[events]
-        WHERE [timestamp] >= DATEADD(day, -@Days, GETDATE())
+         WHERE [timestamp] >= DATEADD(day, -@Days, SYSUTCDATETIME())
         GROUP BY CAST([timestamp] AS DATE), [type]
         ORDER BY date DESC;
     END
@@ -198,8 +198,8 @@ BEGIN
     BEGIN
         SET NOCOUNT ON;
         
-        DELETE FROM [dbo].[events]
-        WHERE [timestamp] < DATEADD(day, -@RetentionDays, GETDATE());
+         DELETE FROM [dbo].[events]
+         WHERE [timestamp] < DATEADD(day, -@RetentionDays, SYSUTCDATETIME());
         
         SELECT @@ROWCOUNT as rows_deleted;
     END

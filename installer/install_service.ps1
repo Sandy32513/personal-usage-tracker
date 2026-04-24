@@ -69,23 +69,28 @@ if (-not (Test-Path $exePath)) {
 Write-Host "Executable: $exePath" -ForegroundColor Green
 Write-Host ""
 
-# Install the service
-Write-Host "[3/8] Setting up data directories..." -ForegroundColor Cyan
-New-Item -ItemType Directory -Force -Path "data" | Out-Null
-New-Item -ItemType Directory -Force -Path "logs" | Out-Null
-New-Item -ItemType Directory -Force -Path "exports" | Out-Null
-Write-Host "Directories created: data, logs, exports" -ForegroundColor Green
+# Step 1: Install the Windows Service
+Write-Host "[2/4] Installing Windows Service..." -ForegroundColor Cyan
+
+# Build base directory (ProgramData)
+$baseDir = $env:USAGE_TRACKER_BASE_DIR
+if (-not $baseDir) {
+    $baseDir = Join-Path $env:ProgramData "PersonalUsageTracker"
+}
+Write-Host "Using base directory: $baseDir" -ForegroundColor Gray
+
+# Ensure directories exist
+New-Item -ItemType Directory -Force -Path (Join-Path $baseDir "data") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $baseDir "logs") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $baseDir "exports") | Out-Null
+Write-Host "Data directories created under base" -ForegroundColor Green
 Write-Host ""
 
-# Install the service
-Write-Host "[4/8] Installing Windows Service..." -ForegroundColor Cyan
-Write-Host "Configuring service with least-privilege account..." -ForegroundColor Gray
-
-# Use NETWORK SERVICE (least privilege built-in account)
-# Alternative: Use dedicated local user if you prefer
+# Service account
 $serviceAccount = "NT AUTHORITY\NETWORK SERVICE"
 $absoluteExePath = (Resolve-Path $exePath).Path
 
+Write-Host "Creating Windows Service..." -ForegroundColor Gray
 sc.exe create $serviceName binPath= "`"$absoluteExePath`"" start= auto obj= $serviceAccount DisplayName= "Personal Usage Tracker V3" | Out-Null
 
 if ($LASTEXITCODE -ne 0) {

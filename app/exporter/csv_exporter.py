@@ -114,7 +114,7 @@ class CSVExporter:
                     duration_seconds
                 FROM events
                 WHERE type = ?
-                AND timestamp > DATEADD(day, -?, GETDATE())
+                AND timestamp > DATEADD(day, -?, SYSUTCDATETIME())
                 ORDER BY timestamp DESC
             '''
             
@@ -170,7 +170,7 @@ class CSVExporter:
                     duration_seconds
                 FROM events
                 WHERE type = ?
-                AND timestamp > DATEADD(day, -?, GETDATE())
+                AND timestamp > DATEADD(day, -?, SYSUTCDATETIME())
                 ORDER BY timestamp DESC
             '''
             
