@@ -169,36 +169,51 @@ class UsageTrackerService(win32serviceutil.ServiceFramework):
             self.SvcStop()
     
      def main(self):
-         """Main service logic"""
-         logger.info("Initializing Personal Usage Tracker Service...")
-         
-         # 1. Test DB connection and schema (fail fast)
-         logger.info("Testing SQL Server connection...")
-         self.db = SQLServerDB()
-         if not self.db.test_connection():
-             logger.critical("Database unavailable or schema invalid — service cannot start")
-             raise RuntimeError("Database connection/schema validation failed")
-         logger.info("Database OK")
-         
-         # 2. Initialize components
-         self.queue = PersistentQueue()
-         logger.info("Persistent queue initialized")
-         
-         self.processor = ProcessorWorker()
-         self.processor.start()
-         logger.info("Processor worker started")
-         
-         self.exporter = CSVExporter()
-         self.exporter.start()
-         logger.info("CSV exporter started")
-         
-         self.health_server = HealthServer()
-         self.health_server.start()
-         logger.info("Health server started")
-         
-         # 3. Start IPC server to receive events from user-session agent
-         self._start_ipc_server()
-         logger.info("IPC server started — waiting for agent connections")
+        """Main service logic"""
+        logger.info("Initializing Personal Usage Tracker Service...")
+        
+        # 1. Test DB connection and schema with retry (C4-retry enhancement)
+        logger.info("Testing SQL Server connection and schema...")
+        self.db = SQLServerDB()
+        
+        max_attempts = 3
+        attempt = 1
+        while attempt <= max_attempts:
+            if self.db.test_connection():
+                logger.info(f"Database OK on attempt {attempt}")
+                break
+            else:
+                logger.warning(f"Database connection attempt {attempt}/{max_attempts} failed")
+                if attempt < max_attempts:
+                    backoff = 5 * attempt  # 5s, 10s, 15s
+                    logger.info(f"Retrying in {backoff} seconds...")
+                    time.sleep(backoff)
+                    attempt += 1
+                else:
+                    logger.critical(f"All {max_attempts} DB connection attempts failed — service cannot start")
+                    raise RuntimeError("Database connection failed after retries")
+        
+        logger.info("Database schema validated")
+        
+        # 2. Initialize remaining components
+        self.queue = PersistentQueue()
+        logger.info("Persistent queue initialized")
+        
+        self.processor = ProcessorWorker()
+        self.processor.start()
+        logger.info("Processor worker started")
+        
+        self.exporter = CSVExporter()
+        self.exporter.start()
+        logger.info("CSV exporter started")
+        
+        self.health_server = HealthServer()
+        self.health_server.start()
+        logger.info("Health server started")
+        
+        # 3. Start IPC server to receive events from user-session agent
+        self._start_ipc_server()
+        logger.info("IPC server started — waiting for agent connections")
          
          # 4. Service monitoring loop
          self.running = True
