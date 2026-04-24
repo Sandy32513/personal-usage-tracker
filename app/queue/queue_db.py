@@ -87,10 +87,10 @@ class PersistentQueue:
             logger.error(f"Failed to initialize queue DB: {e}")
             raise
 
-    def _recover_stale_processing(self, stale_timeout_minutes: int = 30, conn: sqlite3.Connection = None):
+    def _recover_stale_processing(self, stale_timeout_minutes: int = 5, conn: sqlite3.Connection = None):
         """
         Reset events stuck in 'processing' state back to 'pending'.
-        Called on startup and can be called periodically.
+        Called on startup and periodically by processor worker.
         Returns number of recovered events.
         If conn is provided, use it; otherwise create a new connection.
         """
@@ -204,42 +204,50 @@ class PersistentQueue:
     
     def dequeue_batch(self, batch_size: int = 10) -> List[Dict[str, Any]]:
         """
-        Get a batch of pending events for processing
-        Returns list of event dicts with queue_id, payload, and retry_count
+        Atomically claim a batch of pending events for processing.
+        Uses single UPDATE...RETURNING transaction to avoid race conditions.
+        Returns list of claimed event payloads with queue_id.
         """
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
+            conn = sqlite3.connect(self.db_path, isolation_level='DEFERRED')
             cursor = conn.cursor()
-            
             now = datetime.now().isoformat()
             
-            # Get pending events that are ready for retry (next_retry_at is NULL or in past)
+            # Atomically claim batch using UPDATE...RETURNING (SQLite 3.35+)
             cursor.execute('''
-                SELECT id, payload, retry_count FROM queue_events
-                WHERE status = ? 
-                  AND (next_retry_at IS NULL OR next_retry_at <= ?)
-                ORDER BY created_at ASC
-                LIMIT ?
-            ''', (QUEUE_STATUS['PENDING'], now, batch_size))
+                UPDATE queue_events
+                SET status = ?, updated_at = ?
+                WHERE id IN (
+                    SELECT id FROM queue_events
+                    WHERE status = ?
+                    AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                )
+                RETURNING id, payload, retry_count
+            ''', (QUEUE_STATUS['PROCESSING'], now, QUEUE_STATUS['PENDING'], now, batch_size))
             
             rows = cursor.fetchall()
-            events = []
-            
-            for row in rows:
-                try:
-                    payload = json.loads(row['payload'])
-                    events.append({
-                        'queue_id': row['id'],
-                        'payload': payload,
-                        'retry_count': row['retry_count']
-                    })
-                except json.JSONDecodeError as e:
-                    logger.error(f"Invalid JSON payload in queue ID {row['id']}: {e}")
-                    # Mark as failed
-                    self.mark_failed(row['id'], "JSON decode error")
-            
+            conn.commit()
             conn.close()
+            
+            events = []
+            for row in rows:
+                queue_id, payload_json, retry_count = row
+                try:
+                    payload = json.loads(payload_json)
+                    events.append({
+                        'queue_id': queue_id,
+                        'payload': payload,
+                        'retry_count': retry_count
+                    })
+                except json.JSONDecodeError:
+                    logger.error(f"Invalid JSON in queue ID {queue_id}, skipping")
+                    # Mark as failed to remove from queue
+                    self.mark_failed(queue_id, "JSON decode error")
+            
+            if events:
+                logger.debug(f"Atomically claimed {len(events)} events")
             return events
             
         except Exception as e:

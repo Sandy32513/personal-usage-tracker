@@ -101,6 +101,8 @@ class ProcessorWorker:
         }
         self.last_cleanup_time = time.time()
         self.cleanup_interval = 86400  # Once per day
+        self.last_recovery_time = time.time()
+        self.recovery_interval = 300  # Every 5 minutes
         self.circuit_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60)
     
     def start(self):
@@ -144,6 +146,16 @@ class ProcessorWorker:
                     except Exception as e:
                         logger.error(f"Queue cleanup failed: {e}")
                     self.last_cleanup_time = current_time
+                
+                # Periodic recovery of stale processing events (C2 fix)
+                if current_time - self.last_recovery_time >= self.recovery_interval:
+                    try:
+                        recovered = self.queue._recover_stale_processing(stale_timeout_minutes=5)
+                        if recovered > 0:
+                            logger.info(f"Recovered {recovered} stale processing events")
+                    except Exception as e:
+                        logger.error(f"Recovery failed: {e}")
+                    self.last_recovery_time = current_time
                 
                 # Process batch of events
                 self._process_batch()
