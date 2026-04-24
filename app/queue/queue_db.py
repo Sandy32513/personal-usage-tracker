@@ -29,14 +29,13 @@ class QueueCorruptionError(Exception):
 
 class PersistentQueue:
     """
-    Persistent queue using SQLite with retry logic
-    Ensures no data loss during system failures
-    Max size prevents disk exhaustion
-    WAL mode for better concurrency
+    Persistent queue using SQLite with retry logic and guaranteed delivery
+    All events are persisted before processing to ensure zero data loss
+    Max size prevents disk exhaustion, WAL mode for better concurrency
     """
     
-    def __init__(self, max_size: int = None):
-        self.db_path = QUEUE_DB_PATH
+    def __init__(self, max_size: int = None, db_path: str = None):
+        self.db_path = db_path if db_path is not None else QUEUE_DB_PATH
         self.max_size = max_size if max_size is not None else MAX_QUEUE_SIZE
         self._write_lock = threading.Lock()  # Atomic check+insert
         self._init_db()
@@ -535,9 +534,15 @@ class PersistentQueue:
         except Exception as e:
             logger.error(f"Failed to cleanup old events: {e}")
             return 0
-
-
-# Standalone test
+    
+    def close(self):
+        """Close any resources (no-op for SQLite connection-per-call design)."""
+        # SQLite connections are opened/closed per operation, no persistent connection to close.
+        # This method exists for test fixture compatibility.
+        pass
+    
+    # ===== Standalone Test =====
+    
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     

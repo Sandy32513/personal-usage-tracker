@@ -37,7 +37,7 @@ See [BUGS.md](BUGS.md) for full bug register and status.
 
 ```
 ┌─────────────────┐      TCP 8766      ┌─────────────────────┐
-│    User Agent   │ ──────────────────▶ │  Windows Service    │
+│    User Agent   │ ──────────────────▶ │  Windows Service   │
 │  (per-user)     │                     │  (Session 0)        │
 │                 │   IPC: JSON lines   │                     │
 │ • AppTracker    │ ◀─────────────────  │ • Queue (SQLite)   │

@@ -6,7 +6,7 @@ Single source of truth for usage data
 
 import logging
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Tuple
 
 import pyodbc
 
@@ -299,14 +299,6 @@ class SQLServerDB:
                 except:
                     pass
             return [], list(range(len(payloads)))  # All failed
-            
-            else:
-                logger.error(f"Unknown event type: {event_type}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Failed to insert event from queue: {e}")
-            return False
     
     def test_connection(self) -> bool:
         """Test database connectivity"""

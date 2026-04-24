@@ -81,16 +81,14 @@ class CircuitBreaker:
 
 class ProcessorWorker:
     """
-    Queue processor worker that reads from persistent queue
-    and writes to SQL Server with retry and backoff logic
-    Circuit breaker prevents overwhelming DB during outages
-    Supports multi-worker for parallel processing
+    Worker that processes events from the queue and inserts into SQL Server.
+    Supports circuit breaker, retry scheduling, and batch processing.
     """
     
-    def __init__(self, num_workers: int = 1):
+    def __init__(self, num_workers: int = 1, queue: PersistentQueue = None, db = None):
         self.num_workers = num_workers
-        self.queue = PersistentQueue()
-        self.db = SQLServerDB()
+        self.queue = queue if queue is not None else PersistentQueue()
+        self.db = db if db is not None else SQLServerDB()
         self.running = False
         self.threads = []
         self.stats = {
