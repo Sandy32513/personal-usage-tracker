@@ -1,44 +1,302 @@
 """
-Main Entry Point
-Coordinates all components of Personal Usage Tracker V3
-Can run as console app or Windows Service
+Main Entry Point — Personal Usage Tracker V3
+Supports three modes:
+  1. service  — Runs data pipeline (queue, DB insert, export). For Windows Service.
+  2. agent     — Runs capture only (app+browser) and forwards to service via IPC.
+  3. combined  — Legacy single-process mode (both capture + pipeline in one).
 """
 
 import sys
 import time
 import logging
 import argparse
+import asyncio
+from pathlib import Path
+
+# Add project root to path
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
 from app.config import BROWSER_SCAN_INTERVAL, LOG_FILE, LOG_LEVEL, TRACK_INTERVAL, log_config
 from app.tracker.app_tracker import AppTracker
 from app.tracker.browser_tracker import BrowserTracker
-from app.queue.queue_db import PersistentQueue, QueueFullError
+from app.queue.queue_db import PersistentQueue
 from app.processor.worker import ProcessorWorker
 from app.exporter.csv_exporter import CSVExporter
-from app.service.windows_service import ServiceManager
 from app.db.sqlserver import SQLServerDB
 from app.health import HealthServer
 
-# Configure logging
+logger = logging.getLogger(__name__)
+
+
+class UsageTrackerService:
+    """Data pipeline service: receives events (from agent or local), queues, processes, exports."""
+    
+    def __init__(self):
+        self.queue = PersistentQueue()
+        self.processor = None
+        self.exporter = None
+        self.health_server = None
+        self.ipc_server = None
+        self.ipc_thread = None
+        self.running = False
+    
+    def initialize(self):
+        logger.info("Initializing data pipeline service...")
+        self.processor = ProcessorWorker()
+        self.processor.start()
+        logger.info("Processor worker started")
+        
+        self.exporter = CSVExporter()
+        self.exporter.start()
+        logger.info("CSV exporter started")
+        
+        self.health_server = HealthServer()
+        self.health_server.start()
+        logger.info("Health server started")
+        
+        self._start_ipc_server()
+    
+    def _start_ipc_server(self):
+        """Start TCP socket server on 127.0.0.1:8766 to accept events from agent."""
+        import socket
+        import threading
+        import json
+        
+        def client_handler(conn, addr):
+            logger.info(f"Agent connected from {addr}")
+            try:
+                buffer = b''
+                while self.running:
+                    data = conn.recv(4096)
+                    if not data:
+                        break
+                    buffer += data
+                    while b'\n' in buffer:
+                        line, buffer = buffer.split(b'\n', 1)
+                        try:
+                            event = json.loads(line.decode('utf-8'))
+                            # Determine validator
+                            from app.validation import EventValidator
+                            ev_type = event.get('type', 'app')
+                            if ev_type == 'app':
+                                validated = EventValidator.validate_app_event(event)
+                            elif ev_type == 'web':
+                                validated = EventValidator.validate_web_event(event)
+                            else:
+                                validated = None
+                            
+                            if validated:
+                                queue_id = self.queue.enqueue(validated)
+                                logger.debug(f"Enqueued event ID={queue_id} from agent")
+                            else:
+                                logger.warning(f"Invalid event from agent: {event}")
+                        except json.JSONDecodeError:
+                            logger.error(f"Malformed JSON from agent")
+                conn.close()
+                logger.info(f"Agent disconnected: {addr}")
+            except Exception as e:
+                logger.error(f"Client handler error: {e}")
+        
+        def server_loop():
+            host = '127.0.0.1'
+            port = 8766
+            self.ipc_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.ipc_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                self.ipc_server.bind((host, port))
+                self.ipc_server.listen(5)
+                self.ipc_server.settimeout(1)
+                logger.info(f"IPC server listening on {host}:{port}")
+                while self.running:
+                    try:
+                        conn, addr = self.ipc_server.accept()
+                        t = threading.Thread(target=client_handler, args=(conn, addr), daemon=True)
+                        t.start()
+                    except socket.timeout:
+                        continue
+            except Exception as e:
+                logger.error(f"IPC server failed: {e}")
+            finally:
+                self.ipc_server.close()
+        
+        self.ipc_thread = threading.Thread(target=server_loop, daemon=True)
+        self.ipc_thread.start()
+    
+    def run(self):
+        """Main service loop."""
+        logger.info("UsageTracker Service starting...")
+        self.running = True
+        
+        try:
+            while self.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Shutdown requested")
+            self.stop()
+    
+    def stop(self):
+        """Stop all components."""
+        logger.info("Stopping service...")
+        self.running = False
+        if self.processor:
+            self.processor.stop()
+        if self.exporter:
+            self.exporter.stop()
+        if self.health_server:
+            self.health_server.stop()
+        if self.ipc_server:
+            self.ipc_server.close()
+        logger.info("Service stopped")
+
+
+class UsageTrackerAgent:
+    """User-session agent: captures app/browser events and forwards to service."""
+    
+    def __init__(self, service_host='127.0.0.1', service_port=8766):
+        self.service_host = service_host
+        self.service_port = service_port
+        self.app_tracker = AppTracker()
+        self.browser_tracker = BrowserTracker()
+        self.running = False
+        self.last_browser_scan = time.time()
+    
+    def _send_event(self, event: dict) -> bool:
+        """Send event to service via TCP socket."""
+        import socket
+        try:
+            payload = json.dumps(event, ensure_ascii=False) + '\n'
+            with socket.create_connection((self.service_host, self.service_port), timeout=2) as sock:
+                sock.sendall(payload.encode('utf-8'))
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send to service: {e}")
+            return False
+    
+    def run(self):
+        """Main capture loop."""
+        logger.info("UsageTracker Agent starting capture loop...")
+        self.running = True
+        last_scan = time.time()
+        
+        while self.running:
+            try:
+                current_time = time.time()
+                
+                # Capture app event
+                app_event = self.app_tracker.capture_event()
+                if app_event:
+                    self._send_event(app_event)
+                    logger.debug(f"Sent app: {app_event.get('app_name')}")
+                
+                # Capture browser events periodically
+                if current_time - last_scan >= BROWSER_SCAN_INTERVAL:
+                    try:
+                        browser_events = self.browser_tracker.capture_events()
+                        for bev in browser_events:
+                            self._send_event(bev)
+                        logger.debug(f"Sent {len(browser_events)} browser events")
+                    except Exception as e:
+                        logger.error(f"Browser capture error: {e}")
+                    last_scan = current_time
+                
+                time.sleep(TRACK_INTERVAL)
+            except Exception as e:
+                logger.error(f"Agent loop error: {e}", exc_info=True)
+                time.sleep(5)
+    
+    def stop(self):
+        self.running = False
+        logger.info("Agent stopped")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Personal Usage Tracker V3")
+    parser.add_argument('mode', choices=['service', 'agent', 'combined', 'run'], 
+                        default='run', nargs='?',
+                        help='Run mode: service (data pipeline), agent (capture only), combined (all-in-one, legacy)')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    args = parser.parse_args()
+    
+    # Setup logging
+    setup_logging()
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    logger.info(f"Starting in '{args.mode}' mode")
+    
+    if args.mode == 'service':
+        svc = UsageTrackerService()
+        svc.initialize()
+        svc.run()
+    elif args.mode == 'agent':
+        agent = UsageTrackerAgent()
+        try:
+            agent.run()
+        except KeyboardInterrupt:
+            agent.stop()
+    elif args.mode in ['run', 'combined']:
+        # Legacy combined mode (single process)
+        logger.warning("'combined' mode is deprecated; use 'service'+'agent' for production")
+        run_combined_mode()
+
+
+def run_combined_mode():
+    """Legacy single-process mode (all components in one)."""
+    from app.validation import EventValidator
+    validator = EventValidator()
+    
+    queue = PersistentQueue()
+    processor = ProcessorWorker()
+    exporter = CSVExporter()
+    app_tracker = AppTracker()
+    browser_tracker = BrowserTracker()
+    
+    processor.start()
+    exporter.start()
+    exporter.run_once()  # initial export
+    
+    last_browser = time.time()
+    logger.info("Combined mode started")
+    
+    try:
+        while True:
+            # App capture
+            app_event = app_tracker.capture_event()
+            if app_event:
+                validated = validator.validate_app_event(app_event)
+                if validated:
+                    queue.enqueue(validated)
+            
+            # Browser capture
+            if time.time() - last_browser >= BROWSER_SCAN_INTERVAL:
+                try:
+                    events = browser_tracker.capture_events()
+                    for ev in events:
+                        v = validator.validate_web_event(ev)
+                        if v:
+                            queue.enqueue(v)
+                    last_browser = time.time()
+                except Exception as e:
+                    logger.error(f"Browser capture error: {e}")
+            
+            time.sleep(TRACK_INTERVAL)
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        processor.stop()
+        exporter.stop()
+
+
 def setup_logging():
-    """Configure logging for the application with rotation"""
+    """Configure logging."""
     log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    
-    # Create handlers
     handlers = [logging.StreamHandler(sys.stdout)]
-    
-    # Add rotating file handler if log path is writable
     try:
         from logging.handlers import RotatingFileHandler
-        max_bytes = 10 * 1024 * 1024  # 10MB max per file
-        backup_count = 5  # Keep 5 backup files
         handlers.append(RotatingFileHandler(
-            LOG_FILE, 
-            maxBytes=max_bytes, 
-            backupCount=backup_count,
-            encoding='utf-8'
+            LOG_FILE, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'
         ))
     except Exception:
-        # Fallback to basic file handler
         try:
             handlers.append(logging.FileHandler(LOG_FILE, encoding='utf-8'))
         except:
@@ -49,244 +307,8 @@ def setup_logging():
         format=log_format,
         handlers=handlers
     )
-    
-    # Reduce noise from some libraries
     logging.getLogger('pyodbc').setLevel(logging.WARNING)
-    logging.getLogger('pandas').setLevel(logging.WARNING)
-
-logger = logging.getLogger(__name__)
 
 
-class UsageTrackerApp:
-    """
-    Main application coordinator
-    Manages all components and their lifecycles
-    """
-    
-    def __init__(self):
-        self.app_tracker = None
-        self.browser_tracker = None
-        self.queue = None
-        self.processor = None
-        self.exporter = None
-        self.db = None
-        self.health_server = None
-        self.running = False
-    
-    def initialize(self):
-        """Initialize all components"""
-        logger.info("Initializing Personal Usage Tracker V3...")
-        
-        # Test database connection first
-        logger.info("Testing SQL Server connection...")
-        try:
-            self.db = SQLServerDB()
-            if not self.db.test_connection():
-                logger.warning("SQL Server is currently unavailable. Tracking will continue and the queue will buffer events.")
-        except Exception as e:
-            logger.warning(f"Database initialization warning: {e}")
-        
-        # Initialize components
-        self.app_tracker = AppTracker()
-        logger.info("App tracker initialized")
-        
-        self.browser_tracker = BrowserTracker()
-        logger.info("Browser tracker initialized")
-        
-        self.queue = PersistentQueue()
-        logger.info("Persistent queue initialized")
-        
-        self.processor = ProcessorWorker()
-        logger.info("Processor worker initialized")
-        
-        self.exporter = CSVExporter()
-        logger.info("CSV exporter initialized")
-        
-        logger.info("All components initialized successfully")
-        return True
-    
-    def start(self):
-        """Start all components"""
-        if not self.initialize():
-            logger.error("Initialization failed, cannot start")
-            return False
-        
-        logger.info("Starting all components...")
-        
-        # Start health server
-        self.health_server = HealthServer()
-        if self.health_server.start():
-            logger.info("Health server started")
-        else:
-            logger.warning("Health server failed to start")
-        
-        # Start processor (reads from queue -> DB)
-        self.processor.start()
-        logger.info("Processor started")
-        
-        # Start exporter (writes CSV from DB)
-        self.exporter.start()
-        logger.info("Exporter started")
-        
-        self.running = True
-        logger.info("✓ Personal Usage Tracker V3 is now running")
-        return True
-    
-    def stop(self):
-        """Stop all components"""
-        self.running = False
-        
-        if self.health_server:
-            self.health_server.stop()
-            logger.info("Health server stopped")
-        
-        if self.exporter:
-            self.exporter.stop()
-            logger.info("Exporter stopped")
-        
-        if self.processor:
-            self.processor.stop()
-            logger.info("Processor stopped")
-        
-        logger.info("All components stopped")
-    
-    def run_forever(self):
-        """Main tracking loop - runs forever"""
-        if not self.start():
-            return
-        
-        last_browser_scan = time.time()
-        
-        try:
-            while self.running:
-                try:
-                    current_time = time.time()
-                    
-                    # Capture and queue active application
-                    app_event = self.app_tracker.capture_event()
-                    if app_event:
-                        try:
-                            self.queue.enqueue(app_event)
-                            logger.debug(f"Queued: {app_event['app_name']} - {app_event['window_title'][:50]}")
-                        except QueueFullError:
-                            logger.error("Queue is full! Event dropped. Check processor/DB performance.")
-                    
-                    # Capture browser history every 30 seconds
-                    if current_time - last_browser_scan >= BROWSER_SCAN_INTERVAL:
-                        try:
-                            browser_events = self.browser_tracker.capture_events()
-                            if browser_events:
-                                try:
-                                    self.queue.enqueue_bulk(browser_events)
-                                    logger.debug(f"Queued {len(browser_events)} browser events")
-                                except QueueFullError:
-                                    logger.error(f"Queue full! Dropped {len(browser_events)} browser events")
-                        except Exception as e:
-                            logger.error(f"Browser tracking error: {e}")
-                        
-                        last_browser_scan = current_time
-                    
-                    # Sleep for track interval
-                    time.sleep(TRACK_INTERVAL)
-                    
-                except KeyboardInterrupt:
-                    logger.info("Keyboard interrupt received")
-                    break
-                except Exception as e:
-                    logger.error(f"Error in tracking loop: {e}", exc_info=True)
-                    time.sleep(5)  # Error backoff
-        
-        finally:
-            self.shutdown()
-    
-    def shutdown(self):
-        """Graceful shutdown"""
-        logger.info("Shutting down...")
-        self.running = False
-        
-        # Stop components
-        if self.processor:
-            self.processor.stop()
-        
-        if self.exporter:
-            self.exporter.stop()
-        
-        logger.info("Shutdown complete")
-
-
-def parse_args():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(
-        description='Personal Usage Tracker V3 - Track app usage and browser activity'
-    )
-    parser.add_argument(
-        'command',
-        choices=['run', 'export', 'install', 'remove', 'start', 'stop', 'status'],
-        help='Command to execute'
-    )
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='Run in debug mode (console output)'
-    )
-    return parser.parse_args()
-
-
-def main():
-    """Main entry point"""
-    if getattr(sys, 'frozen', False) and len(sys.argv) == 1:
-        import win32serviceutil
-        from app.service.windows_service import UsageTrackerService
-
-        win32serviceutil.HandleCommandLine(UsageTrackerService)
-        return
-
-    args = parse_args()
-    
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
-    if args.command == 'run':
-        app = UsageTrackerApp()
-        app.run_forever()
-    
-    elif args.command == 'export':
-        setup_logging()
-        logger.info("CSV Export command invoked")
-        
-        # Connect to DB
-        db = SQLServerDB()
-        if not db.test_connection():
-            logger.error("Cannot connect to SQL Server")
-            sys.exit(1)
-        
-        exporter = CSVExporter()
-        result = exporter.export_manual()
-        
-        if result.get('app') and result.get('web'):
-            logger.info("CSV export completed successfully")
-            sys.exit(0)
-        else:
-            logger.error("CSV export failed")
-            sys.exit(1)
-    
-    elif args.command == 'install':
-        ServiceManager.install()
-    
-    elif args.command == 'remove':
-        ServiceManager.remove()
-    
-    elif args.command == 'start':
-        ServiceManager.start()
-    
-    elif args.command == 'stop':
-        ServiceManager.stop()
-    
-    elif args.command == 'status':
-        ServiceManager.status()
-
-
-if __name__ == "__main__":
-    setup_logging()
-    log_config()
+if __name__ == '__main__':
     main()

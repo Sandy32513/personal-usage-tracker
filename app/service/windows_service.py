@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 class UsageTrackerService(win32serviceutil.ServiceFramework):
     """
     Windows Service for Personal Usage Tracker V3
-    Manages tracking and processing in background
+    Manages queue processing and export; receives events from user-session agent via IPC.
     """
     
     _svc_name_ = SERVICE_NAME
@@ -55,6 +55,75 @@ class UsageTrackerService(win32serviceutil.ServiceFramework):
         self.exporter = None
         
         logger.info("Service initialized")
+    
+    def _start_ipc_server(self):
+        """Start TCP socket server to receive events from user-session agent."""
+        import socket
+        import threading
+        
+        self.ipc_server = None
+        self.ipc_thread = None
+        
+        def client_handler(conn, addr):
+            """Handle incoming agent connection."""
+            logger.info(f"Agent connected from {addr}")
+            try:
+                buffer = b''
+                while self.running:
+                    data = conn.recv(4096)
+                    if not data:
+                        break
+                    buffer += data
+                    while b'\n' in buffer:
+                        line, buffer = buffer.split(b'\n', 1)
+                        try:
+                            event = json.loads(line.decode('utf-8'))
+                            # Validate and enqueue
+                            from app.validation import EventValidator
+                            if event.get('type') == 'app':
+                                validated = EventValidator.validate_app_event(event)
+                            elif event.get('type') == 'web':
+                                validated = EventValidator.validate_web_event(event)
+                            else:
+                                validated = None
+                            
+                            if validated:
+                                queue_id = self.queue.enqueue(validated)
+                                logger.debug(f"Queued event from agent ID={queue_id} type={validated.get('type')}")
+                            else:
+                                logger.warning(f"Invalid event from agent: {event}")
+                        except json.JSONDecodeError:
+                            logger.error(f"Invalid JSON from agent: {line}")
+                conn.close()
+                logger.info(f"Agent disconnected from {addr}")
+            except Exception as e:
+                logger.error(f"Client handler error: {e}")
+        
+        def server_loop():
+            """Server listening loop."""
+            host = '127.0.0.1'
+            port = 8766
+            self.ipc_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.ipc_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                self.ipc_server.bind((host, port))
+                self.ipc_server.listen(5)
+                self.ipc_server.settimeout(1)
+                logger.info(f"IPC server listening on {host}:{port}")
+                while self.running:
+                    try:
+                        conn, addr = self.ipc_server.accept()
+                        client_thread = threading.Thread(target=client_handler, args=(conn, addr), daemon=True)
+                        client_thread.start()
+                    except socket.timeout:
+                        continue
+            except Exception as e:
+                logger.error(f"IPC server failed: {e}")
+            finally:
+                self.ipc_server.close()
+        
+        self.ipc_thread = threading.Thread(target=server_loop, daemon=True)
+        self.ipc_thread.start()
     
     def SvcStop(self):
         """Service stop handler"""
@@ -88,63 +157,47 @@ class UsageTrackerService(win32serviceutil.ServiceFramework):
             logger.error(f"Service failed: {e}", exc_info=True)
             self.SvcStop()
     
-    def main(self):
-        """Main service logic"""
-        logger.info("Initializing components...")
-        
-        # Initialize components
-        self.app_tracker = AppTracker()
-        self.browser_tracker = BrowserTracker()
-        self.queue = PersistentQueue()
-        self.processor = ProcessorWorker()
-        self.exporter = CSVExporter()
-        
-        # Start processor worker (reads from queue -> SQL Server)
-        self.processor.start()
-        logger.info("Processor worker started")
-        
-        # Start exporter worker (exports to CSV periodically)
-        self.exporter.start()
-        logger.info("CSV exporter started")
-        
-        # Service loop - track events
-        self.running = True
-        last_browser_scan = time.time()
-        
-        logger.info("Service entering main tracking loop")
-        
-        while self.running:
-            try:
-                current_time = time.time()
-                
-                # Track active application
-                app_event = self.app_tracker.capture_event()
-                if app_event:
-                    self.queue.enqueue(app_event)
-                    logger.debug(f"Queued app event: {app_event['app_name']}")
-                
-                # Track browser activity periodically
-                if current_time - last_browser_scan >= BROWSER_SCAN_INTERVAL:
-                    try:
-                        browser_events = self.browser_tracker.capture_events()
-                        if browser_events:
-                            self.queue.enqueue_bulk(browser_events)
-                            logger.debug(f"Queued {len(browser_events)} browser events")
-                    except Exception as e:
-                        logger.error(f"Browser tracking error: {e}")
-                    
-                    last_browser_scan = current_time
-                
-                # Check for stop event
-                if win32event.WaitForSingleObject(self.hWaitStop, 5000) == win32event.WAIT_OBJECT_0:
-                    logger.info("Stop event received")
-                    break
-                
-            except Exception as e:
-                logger.error(f"Error in main loop: {e}", exc_info=True)
-                time.sleep(5)  # Error backoff
-        
-        logger.info("Service main loop exited")
+     def main(self):
+         """Main service logic"""
+         logger.info("Initializing components...")
+         
+         # Initialize components
+         self.queue = PersistentQueue()
+         self.processor = ProcessorWorker()
+         self.exporter = CSVExporter()
+         
+         # Start processor worker (reads from queue -> SQL Server)
+         self.processor.start()
+         logger.info("Processor worker started")
+         
+         # Start exporter worker (exports to CSV periodically)
+         self.exporter.start()
+         logger.info("CSV exporter started")
+         
+         # Start IPC server to receive events from user-session agent
+         self._start_ipc_server()
+         
+         # Service loop - monitor health
+         self.running = True
+         logger.info("Service entering main monitoring loop")
+         
+         while self.running:
+             try:
+                 # Check for stop event
+                 if win32event.WaitForSingleObject(self.hWaitStop, 5000) == win32event.WAIT_OBJECT_0:
+                     logger.info("Stop event received")
+                     break
+                 
+                 # Log periodic health status
+                 queue_size = self.queue.get_size()
+                 if queue_size > 100000:
+                     logger.warning(f"High queue backpressure: {queue_size} events")
+                 
+             except Exception as e:
+                 logger.error(f"Error in main loop: {e}", exc_info=True)
+                 time.sleep(5)
+         
+         logger.info("Service main loop exited")
     
     @staticmethod
     def install_service():
