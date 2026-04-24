@@ -12,7 +12,7 @@ import logging
 import time
 import threading
 from datetime import date, datetime
-from typing import Dict
+from typing import Dict, Any
 
 from app.config import APP_USAGE_CSV, DATA_RETENTION_DAYS, EVENT_TYPE, EXPORT_DIR, EXPORT_INTERVAL, WEB_USAGE_CSV
 from app.db.sqlserver import SQLServerDB
@@ -33,6 +33,20 @@ class CSVExporter:
         self.thread = None
         self.last_export = None
         self.stop_event = threading.Event()
+    
+    @staticmethod
+    def _sanitize_csv_field(value: Any) -> str:
+        """
+        Escape leading formula characters to prevent CSV injection attacks.
+        Excel/LibreOffice Calc interpret fields starting with =, +, -, @ as formulas.
+        We prefix with a single quote to force literal interpretation.
+        """
+        if value is None:
+            return ''
+        s = str(value)
+        if s and s[0] in '=+-@':
+            return "'" + s
+        return s
     
     def _get_dated_filename(self, base_name: str) -> str:
         """Generate filename with current date"""
@@ -140,8 +154,14 @@ class CSVExporter:
                 writer = csv.writer(gz)
                 # Header
                 writer.writerow(['id', 'app_name', 'window_title', 'timestamp', 'duration_seconds'])
-                # Data rows
+                # Data rows — sanitize string fields to prevent CSV injection
                 for row in rows:
+                    row = list(row)  # Convert tuple to list for mutation
+                    # row indices: 0=id, 1=app_name, 2=window_title, 3=timestamp, 4=duration_seconds
+                    if len(row) > 1:
+                        row[1] = self._sanitize_csv_field(row[1])
+                    if len(row) > 2:
+                        row[2] = self._sanitize_csv_field(row[2])
                     writer.writerow(row)
             
             logger.info(f"Exported {len(rows)} app usage records to {gzip_file}")
@@ -196,8 +216,14 @@ class CSVExporter:
                 writer = csv.writer(gz)
                 # Header
                 writer.writerow(['id', 'app_name', 'url', 'title', 'timestamp', 'duration_seconds'])
-                # Data rows
+                # Data rows — sanitize string fields (url, title)
                 for row in rows:
+                    row = list(row)
+                    # indices: 0=id, 1=app_name, 2=url, 3=title, 4=timestamp, 5=duration_seconds
+                    if len(row) > 2:
+                        row[2] = self._sanitize_csv_field(row[2])
+                    if len(row) > 3:
+                        row[3] = self._sanitize_csv_field(row[3])
                     writer.writerow(row)
             
             conn.close()
