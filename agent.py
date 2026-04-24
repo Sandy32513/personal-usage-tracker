@@ -3,12 +3,12 @@ Personal Usage Tracker — User Agent
 Runs in user session, captures app/browser activity, sends to service via IPC.
 """
 
-import asyncio
 import json
 import logging
 import os
 import sys
 import time
+import socket
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -36,18 +36,15 @@ class UsageTrackerAgent:
         self.running = False
         self.last_browser_scan = time.time()
         
-    async def send_event_to_service(self, event: dict) -> bool:
-        """Send event to service via TCP socket."""
+    def send_event_to_service(self, event: dict) -> bool:
+        """Send event to service via TCP socket (synchronous)."""
         try:
-            # Use simple TCP socket to send JSON line
-            import socket
-            payload = json.dumps(event) + '\n'
+            payload = json.dumps(event, ensure_ascii=False) + '\n'
             with socket.create_connection((self.service_host, self.service_port), timeout=2) as sock:
                 sock.sendall(payload.encode('utf-8'))
             return True
         except Exception as e:
             logger.error(f"Failed to send event to service: {e}")
-            # Fallback: write to local queue file (will be picked up by service)
             return self._fallback_queue(event)
     
     def _fallback_queue(self, event: dict) -> bool:
@@ -78,7 +75,7 @@ class UsageTrackerAgent:
                 if app_event:
                     validated = self.validator.validate_app_event(app_event)
                     if validated:
-                        asyncio.run(self.send_event_to_service(validated))
+                        self.send_event_to_service(validated)
                         logger.debug(f"Sent app event: {validated.get('app_name')}")
                 
                 # 2. Capture browser history periodically
@@ -88,7 +85,7 @@ class UsageTrackerAgent:
                         for bev in browser_events:
                             validated = self.validator.validate_web_event(bev)
                             if validated:
-                                asyncio.run(self.send_event_to_service(validated))
+                                self.send_event_to_service(validated)
                         logger.debug(f"Sent {len(browser_events)} browser events")
                     except Exception as e:
                         logger.error(f"Browser capture error: {e}")

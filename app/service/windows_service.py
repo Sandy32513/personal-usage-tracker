@@ -48,9 +48,13 @@ class UsageTrackerService(win32serviceutil.ServiceFramework):
         self.processor_thread = None
         
         # Components
+        self.db = None
         self.queue = None
         self.processor = None
         self.exporter = None
+        self.health_server = None
+        self.ipc_server = None
+        self.ipc_thread = None
         
         logger.info("Service initialized")
     
