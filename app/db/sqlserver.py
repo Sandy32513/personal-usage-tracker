@@ -30,19 +30,34 @@ class SQLServerDB:
         if test_on_init:
             self._test_connection()
     
-    def _test_connection(self):
-        """Test initial connection to SQL Server"""
+    def test_connection(self) -> bool:
+        """Test initial connection to SQL Server and verify schema availability"""
         try:
             conn = pyodbc.connect(self.conn_str, autocommit=False, timeout=self.timeout)
             cursor = conn.cursor()
             cursor.execute("SELECT 1")
+            cursor.fetchone()
+            
+            # Also verify critical table exists (C4 fix)
+            cursor.execute("""
+                SELECT COUNT(*) FROM sys.tables 
+                WHERE name = 'events'
+            """)
+            if cursor.fetchone()[0] == 0:
+                logger.critical("Database schema not initialized: 'events' table missing. "
+                               "Run installer/schema.sql to create schema.")
+                cursor.close()
+                conn.close()
+                return False
+            
             cursor.close()
             conn.close()
-            logger.info("Successfully connected to SQL Server")
+            logger.info("Successfully connected to SQL Server (schema validated)")
+            return True
         except Exception as e:
             logger.error(f"Failed to connect to SQL Server: {e}")
             logger.warning("Ensure SQL Server is running and credentials are correct")
-            # Don't raise - allow system to retry later
+            return False
     
     def _get_connection(self) -> Optional[pyodbc.Connection]:
         """Get a fresh database connection"""

@@ -33,6 +33,7 @@ class UsageTrackerService:
     """Data pipeline service: receives events (from agent or local), queues, processes, exports."""
     
     def __init__(self):
+        self.db = None
         self.queue = PersistentQueue()
         self.processor = None
         self.exporter = None
@@ -42,20 +43,35 @@ class UsageTrackerService:
         self.running = False
     
     def initialize(self):
-        logger.info("Initializing data pipeline service...")
+        """Initialize all components with fail-fast on DB errors"""
+        logger.info("Initializing Personal Usage Tracker Service...")
+        
+        # 1. Test DB connection and schema (C4 fix)
+        logger.info("Testing SQL Server connection and schema...")
+        self.db = SQLServerDB()
+        if not self.db.test_connection():
+            logger.critical("Database unavailable or schema missing — service cannot start")
+            raise RuntimeError("Database connection/schema validation failed")
+        logger.info("Database OK")
+        
+        # 2. Start processor
         self.processor = ProcessorWorker()
         self.processor.start()
         logger.info("Processor worker started")
         
+        # 3. Start exporter
         self.exporter = CSVExporter()
         self.exporter.start()
         logger.info("CSV exporter started")
         
+        # 4. Start health endpoint
         self.health_server = HealthServer()
         self.health_server.start()
         logger.info("Health server started")
         
+        # 5. Start IPC listener for agent events
         self._start_ipc_server()
+        logger.info("IPC server started — waiting for agent connections")
     
     def _start_ipc_server(self):
         """Start TCP socket server on 127.0.0.1:8766 to accept events from agent."""
