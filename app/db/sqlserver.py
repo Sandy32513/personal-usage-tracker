@@ -6,7 +6,7 @@ Single source of truth for usage data
 
 import logging
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import pyodbc
 
@@ -197,6 +197,108 @@ class SQLServerDB:
                     duration_seconds=event_duration
                 )
                 return result is not None
+            
+            else:
+                logger.error(f"Unknown event type: {event_type}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to insert event: {e}")
+            return False
+
+    def insert_batch_from_queue(self, payloads: List[Dict[str, Any]]) -> Tuple[List[int], List[int]]:
+        """
+        Batch insert multiple events from queue in a single transaction.
+        Uses connection reuse for performance.
+        
+        Args:
+            payloads: List of event payload dictionaries
+            
+        Returns:
+            (success_ids, failed_queue_ids) — lists of queue IDs (simulated)
+            Note: Since batch doesn't return individual IDs easily, we return
+            full success/failure at transaction level for now.
+        """
+        if not payloads:
+            return [], []
+        
+        conn = None
+        try:
+            conn = self._get_connection()
+            if not conn:
+                return [], [i for i in range(len(payloads))]
+            
+            cursor = conn.cursor()
+            
+            # Build batch parameters for app and web events separately
+            app_params = []
+            web_params = []
+            
+            for payload in payloads:
+                event_type = payload.get('type')
+                if event_type == EVENT_TYPE['APP']:
+                    app_params.append((
+                        EVENT_TYPE['APP'],
+                        payload.get('app_name', 'Unknown'),
+                        payload.get('window_title', ''),
+                        None,  # url
+                        None,  # title
+                        payload.get('timestamp', datetime.now().isoformat()),
+                        payload.get('duration_seconds', 0)
+                    ))
+                elif event_type == EVENT_TYPE['WEB']:
+                    ts = payload.get('timestamp', payload.get('visit_time', datetime.now().isoformat()))
+                    dur = payload.get('duration_seconds', payload.get('visit_duration', 0))
+                    web_params.append((
+                        EVENT_TYPE['WEB'],
+                        'Chrome',
+                        None,  # window_title
+                        payload.get('url', ''),
+                        payload.get('title', ''),
+                        ts,
+                        dur
+                    ))
+                else:
+                    logger.warning(f"Skipping unknown event type: {event_type}")
+            
+            success_count = 0
+            
+            # Insert app events in batch
+            if app_params:
+                app_query = '''
+                    INSERT INTO events 
+                    (type, app_name, window_title, url, title, timestamp, duration_seconds)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                '''
+                cursor.executemany(app_query, app_params)
+                success_count += len(app_params)
+            
+            # Insert web events in batch
+            if web_params:
+                web_query = '''
+                    INSERT INTO events 
+                    (type, app_name, window_title, url, title, timestamp, duration_seconds)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                '''
+                cursor.executemany(web_query, web_params)
+                success_count += len(web_params)
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            logger.info(f"Batch inserted {success_count} events (app={len(app_params)}, web={len(web_params)})")
+            return list(range(success_count)), []  # All succeeded
+            
+        except Exception as e:
+            logger.error(f"Batch insert failed: {e}")
+            if conn:
+                try:
+                    conn.rollback()
+                    conn.close()
+                except:
+                    pass
+            return [], list(range(len(payloads)))  # All failed
             
             else:
                 logger.error(f"Unknown event type: {event_type}")

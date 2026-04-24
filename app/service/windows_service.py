@@ -12,14 +12,15 @@ import socket
 import time
 import logging
 import sys
+import json
 from typing import Optional
 
-from app.config import BROWSER_SCAN_INTERVAL, SERVICE_DESCRIPTION, SERVICE_DISPLAY_NAME, SERVICE_NAME
+from app.config import SERVICE_DESCRIPTION, SERVICE_DISPLAY_NAME, SERVICE_NAME
 from app.exporter.csv_exporter import CSVExporter
-from app.tracker.app_tracker import AppTracker
-from app.tracker.browser_tracker import BrowserTracker
 from app.queue.queue_db import PersistentQueue
 from app.processor.worker import ProcessorWorker
+from app.db.sqlserver import SQLServerDB
+from app.health import HealthServer
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +45,9 @@ class UsageTrackerService(win32serviceutil.ServiceFramework):
         
         # Service state
         self.running = False
-        self.tracker_thread = None
         self.processor_thread = None
         
         # Components
-        self.app_tracker = None
-        self.browser_tracker = None
         self.queue = None
         self.processor = None
         self.exporter = None
@@ -133,12 +131,21 @@ class UsageTrackerService(win32serviceutil.ServiceFramework):
         
         self.running = False
         
-        # Stop components
+        # Stop components in reverse order
         if hasattr(self, 'processor') and self.processor:
             self.processor.stop()
         
         if hasattr(self, 'exporter') and self.exporter:
             self.exporter.stop()
+        
+        if hasattr(self, 'health_server') and self.health_server:
+            self.health_server.stop()
+        
+        if hasattr(self, 'ipc_server') and self.ipc_server:
+            try:
+                self.ipc_server.close()
+            except:
+                pass
         
         logger.info("Service stopped")
     
@@ -159,36 +166,46 @@ class UsageTrackerService(win32serviceutil.ServiceFramework):
     
      def main(self):
          """Main service logic"""
-         logger.info("Initializing components...")
+         logger.info("Initializing Personal Usage Tracker Service...")
          
-         # Initialize components
+         # 1. Test DB connection and schema (fail fast)
+         logger.info("Testing SQL Server connection...")
+         self.db = SQLServerDB()
+         if not self.db.test_connection():
+             logger.critical("Database unavailable or schema invalid — service cannot start")
+             raise RuntimeError("Database connection/schema validation failed")
+         logger.info("Database OK")
+         
+         # 2. Initialize components
          self.queue = PersistentQueue()
-         self.processor = ProcessorWorker()
-         self.exporter = CSVExporter()
+         logger.info("Persistent queue initialized")
          
-         # Start processor worker (reads from queue -> SQL Server)
+         self.processor = ProcessorWorker()
          self.processor.start()
          logger.info("Processor worker started")
          
-         # Start exporter worker (exports to CSV periodically)
+         self.exporter = CSVExporter()
          self.exporter.start()
          logger.info("CSV exporter started")
          
-         # Start IPC server to receive events from user-session agent
-         self._start_ipc_server()
+         self.health_server = HealthServer()
+         self.health_server.start()
+         logger.info("Health server started")
          
-         # Service loop - monitor health
+         # 3. Start IPC server to receive events from user-session agent
+         self._start_ipc_server()
+         logger.info("IPC server started — waiting for agent connections")
+         
+         # 4. Service monitoring loop
          self.running = True
          logger.info("Service entering main monitoring loop")
          
          while self.running:
              try:
-                 # Check for stop event
                  if win32event.WaitForSingleObject(self.hWaitStop, 5000) == win32event.WAIT_OBJECT_0:
                      logger.info("Stop event received")
                      break
                  
-                 # Log periodic health status
                  queue_size = self.queue.get_size()
                  if queue_size > 100000:
                      logger.warning(f"High queue backpressure: {queue_size} events")

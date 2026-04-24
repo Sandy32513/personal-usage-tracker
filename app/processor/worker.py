@@ -187,6 +187,10 @@ class ProcessorWorker:
             
             logger.debug(f"Processing batch of {len(events)} events")
             
+            # Validate all events first (collect valid ones with their queue_ids)
+            valid_entries = []  # List of (queue_id, validated_payload)
+            validation_failures = 0
+            
             for event_data in events:
                 queue_id = event_data['queue_id']
                 payload = event_data['payload']
@@ -210,30 +214,54 @@ class ProcessorWorker:
                     self.stats['failed'] += 1
                     continue
                 
-                # Mark as processing
+                # Mark as processing (must do before batch to avoid re-queue on crash)
                 self.queue.mark_processing(queue_id)
                 
-                # Try to insert into SQL Server (with circuit breaker monitoring)
-                success = self.db.insert_event_from_queue(validated_payload)
+                valid_entries.append((queue_id, validated_payload))
+            
+            if not valid_entries:
+                return
+            
+            # Extract payloads for batch insert
+            payloads = [entry[1] for entry in valid_entries]
+            queue_ids = [entry[0] for entry in valid_entries]
+            
+            # Batch insert all valid events at once (M4 performance fix)
+            success_count = 0
+            try:
+                # Use batch insert method for performance
+                success_indices, failed_indices = self.db.insert_batch_from_queue(payloads)
                 
-                if success:
-                    # Record success to circuit breaker
-                    self.circuit_breaker.record_success()
-                    
-                    # Mark as completed
-                    self.queue.mark_completed(queue_id)
-                    self.stats['processed'] += 1
-                    logger.debug(f"Successfully processed queue ID {queue_id}")
-                else:
-                    # Record failure to circuit breaker
-                    self.circuit_breaker.record_failure()
-                    
-                    # Schedule retry
-                    if self.queue.schedule_retry(queue_id, retry_count):
+                if success_indices:
+                    for idx in success_indices:
+                        self.queue.mark_completed(queue_ids[idx])
+                        self.stats['processed'] += 1
+                        success_count += 1
+                
+                if failed_indices:
+                    for idx in failed_indices:
+                        qid = queue_ids[idx]
+                        if self.queue.schedule_retry(qid, 0):
+                            self.stats['retried'] += 1
+                        else:
+                            self.stats['failed'] += 1
+                
+            except Exception as e:
+                logger.error(f"Batch insert error: {e}", exc_info=True)
+                # If batch fails as a whole, retry all
+                self.circuit_breaker.record_failure()
+                for qid, _ in valid_entries:
+                    if self.queue.schedule_retry(qid, 0):
                         self.stats['retried'] += 1
                     else:
                         self.stats['failed'] += 1
             
+            # Record circuit breaker success if at least partial success
+            if success_count > 0:
+                self.circuit_breaker.record_success()
+            else:
+                self.circuit_breaker.record_failure()
+                
         except Exception as e:
             logger.error(f"Error processing batch: {e}", exc_info=True)
             self.circuit_breaker.record_failure()
